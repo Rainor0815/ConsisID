@@ -42,6 +42,10 @@ def _load_reference_embedding(
     identity_image_path: Optional[str],
     identity_memory_path: Optional[str],
 ) -> np.ndarray:
+    def _tensor_to_numpy_float32(tensor: torch.Tensor) -> np.ndarray:
+        # NumPy conversion from bf16 tensors is unsupported in some torch builds.
+        return tensor.detach().to(torch.float32).cpu().numpy()
+
     # Prefer the saved ArcFace/Antelope embedding when evaluating memory-driven generations.
     if identity_memory_path is not None:
         try:
@@ -49,9 +53,9 @@ def _load_reference_embedding(
         except TypeError:
             payload = torch.load(identity_memory_path, map_location="cpu")
         if "id_ante_embedding" in payload:
-            return payload["id_ante_embedding"].detach().cpu().numpy()[0]
+            return _tensor_to_numpy_float32(payload["id_ante_embedding"])[0]
         if "id_cond" in payload:
-            return payload["id_cond"].detach().cpu().numpy()[0, :512]
+            return _tensor_to_numpy_float32(payload["id_cond"])[0, :512]
         raise ValueError(f"No ArcFace identity embedding found in: {identity_memory_path}")
 
     if identity_image_path is None:
