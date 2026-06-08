@@ -1,0 +1,14 @@
+python eval/arcface_identity_stability.py `
+  --model_path ckpts `
+  --video_path output/your_long_video.mp4 `
+  --identity_memory_path identity_memory.pt `
+  --chunk_size 49 `
+  --sample_stride 1 `
+  --output_dir output/42_0010.mp4
+
+python eval/arcface_identity_stability.py `
+  --model_path ckpts `
+  --video_path output/your_long_video.mp4 `
+  --identity_image_path asserts/example_images/5.png `
+  --chunk_size 49 `
+  --sample_stride 1
