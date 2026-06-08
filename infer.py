@@ -2,11 +2,13 @@ import argparse
 import os
 import random
 
+import numpy as np
 import torch
 from huggingface_hub import hf_hub_download, snapshot_download
 from diffusers.image_processor import VaeImageProcessor
 from diffusers.training_utils import free_memory
 from diffusers.utils import export_to_video
+from PIL import Image
 
 from models.consisid_utils import prepare_face_models, process_face_embeddings_infer
 from models.pipeline_consisid import ConsisIDPipeline
@@ -16,6 +18,27 @@ from util.utils import load_sd_upscale, upscale_batch_and_concatenate
 
 def get_random_seed():
     return random.randint(0, 2**32 - 1)
+
+
+def _validate_identity_png(identity_image_path: str):
+    if not identity_image_path:
+        raise ValueError("Identity image is required. Please provide --identity_image_path (PNG).")
+
+    # Keep URL support for HF examples while enforcing PNG for local files.
+    if identity_image_path.startswith(("http://", "https://")):
+        return
+
+    if not os.path.exists(identity_image_path):
+        raise FileNotFoundError(f"Identity image not found: {identity_image_path}")
+
+    if not identity_image_path.lower().endswith(".png"):
+        raise ValueError(
+            f"Identity image must be a PNG file for stable identity replacement: {identity_image_path}"
+        )
+
+    # Validate the image can be decoded before entering the pipeline.
+    with Image.open(identity_image_path) as img:
+        img.convert("RGB")
 
 def generate_video(
     prompt: str,
@@ -30,8 +53,14 @@ def generate_video(
     dtype: torch.dtype = torch.bfloat16,
     seed: int = 42,
     img_file_path: str = None,
+    identity_image_path: str = None,
     is_upscale: bool = False,
     is_frame_interpolation: bool = False,
+    num_frames: int = 49,
+    enable_model_cpu_offload: bool = False,
+    enable_sequential_cpu_offload: bool = False,
+    enable_vae_slicing: bool = True,
+    enable_vae_tiling: bool = True,
 ):
     """
     Generates a video based on the given prompt and saves it to the specified path.
@@ -54,6 +83,20 @@ def generate_video(
     """
     # 0. Pre config
     device = "cuda"
+    # Backward compatibility for old CLI flag.
+    identity_image_path = identity_image_path or img_file_path
+    _validate_identity_png(identity_image_path)
+
+    # Keep generation stable across runs when seed is set.
+    if seed is not None:
+        random.seed(seed)
+        np.random.seed(seed)
+        torch.manual_seed(seed)
+        if torch.cuda.is_available():
+            torch.cuda.manual_seed_all(seed)
+    if torch.backends.cudnn.is_available():
+        torch.backends.cudnn.benchmark = False
+        torch.backends.cudnn.deterministic = True
 
     if not os.path.exists(output_path):
         os.makedirs(output_path, exist_ok=True)
@@ -78,21 +121,24 @@ def generate_video(
         pipe.fuse_lora(lora_scale=1 / lora_rank)
 
 
-    # 3. Move to device.
+    # 3. Move to device and apply optional memory-saving features.
     transformer.to(device, dtype=dtype)
     pipe.to(device)
-    # Save Memory. Turn on if you don't have multiple GPUs or enough GPU memory(such as H100) and it will cost more time in inference, it may also reduce the quality
-    # pipe.enable_model_cpu_offload()
-    # pipe.enable_sequential_cpu_offload()
-    # pipe.vae.enable_slicing()
-    # pipe.vae.enable_tiling()
+    if enable_model_cpu_offload:
+        pipe.enable_model_cpu_offload()
+    if enable_sequential_cpu_offload:
+        pipe.enable_sequential_cpu_offload()
+    if enable_vae_slicing:
+        pipe.vae.enable_slicing()
+    if enable_vae_tiling:
+        pipe.vae.enable_tiling()
 
 
     # 4. Prepare model input
     id_cond, id_vit_hidden, image, face_kps = process_face_embeddings_infer(face_helper_1, face_clip_model, face_helper_2,
                                                                             eva_transform_mean, eva_transform_std,
                                                                             face_main_model, device, dtype,
-                                                                            img_file_path, is_align_face=True)
+                                                                            identity_image_path, is_align_face=True)
 
     prompt = prompt.strip('"')
     if negative_prompt:
@@ -107,7 +153,7 @@ def generate_video(
         image=image,
         num_videos_per_prompt=num_videos_per_prompt,
         num_inference_steps=num_inference_steps,
-        num_frames=49,
+        num_frames=num_frames,
         use_dynamic_cfg=False,
         guidance_scale=guidance_scale,
         generator=generator,
@@ -154,7 +200,8 @@ if __name__ == "__main__":
     parser.add_argument("--lora_path", type=str, default=None, help="The path of the LoRA weights to be used")
     parser.add_argument("--lora_rank", type=int, default=128, help="The rank of the LoRA weights")
     # input arguments
-    parser.add_argument("--img_file_path", type=str, default="asserts/example_images/2.png", help="should contain clear face, preferably half-body or full-body image")
+    parser.add_argument("--identity_image_path", type=str, default="asserts/example_images/2.png", help="Path to PNG identity reference image used for identity replacement.")
+    parser.add_argument("--img_file_path", type=str, default=None, help="Deprecated alias for --identity_image_path.")
     parser.add_argument("--prompt", type=str, default="The video captures a boy walking along a city street, filmed in black and white on a classic 35mm camera. His expression is thoughtful, his brow slightly furrowed as if he's lost in contemplation. The film grain adds a textured, timeless quality to the image, evoking a sense of nostalgia. Around him, the cityscape is filled with vintage buildings, cobblestone sidewalks, and softly blurred figures passing by, their outlines faint and indistinct. Streetlights cast a gentle glow, while shadows play across the boy's path, adding depth to the scene. The lighting highlights the boy's subtle smile, hinting at a fleeting moment of curiosity. The overall cinematic atmosphere, complete with classic film still aesthetics and dramatic contrasts, gives the scene an evocative and introspective feel.")
     parser.add_argument("--negative_prompt", type=str, default=None, help="Specify a negative prompt to guide the generation model away from certain undesired features or content.")
     # output arguments
@@ -168,6 +215,11 @@ if __name__ == "__main__":
     # auxiliary model arguments
     parser.add_argument("--is_upscale", action='store_true', help="Enable video upscaling (super-resolution) if this flag is set.")
     parser.add_argument("--is_frame_interpolation", action='store_true', help="Enable frame interpolation to increase frame rate if this flag is set.")
+    parser.add_argument("--num_frames", type=int, default=49, help="Number of frames to generate (lower values reduce VRAM usage).")
+    parser.add_argument("--enable_model_cpu_offload", action='store_true', help="Enable model CPU offload to reduce VRAM usage.")
+    parser.add_argument("--enable_sequential_cpu_offload", action='store_true', help="Enable sequential CPU offload for maximum VRAM savings.")
+    parser.add_argument("--enable_vae_slicing", action=argparse.BooleanOptionalAction, default=True, help="Enable VAE slicing to reduce VAE memory usage.")
+    parser.add_argument("--enable_vae_tiling", action=argparse.BooleanOptionalAction, default=True, help="Enable VAE tiling to reduce VAE memory usage.")
 
     args = parser.parse_args()
 
@@ -202,6 +254,12 @@ if __name__ == "__main__":
         dtype=torch.float16 if args.dtype == "float16" else torch.bfloat16,
         seed=args.seed,
         img_file_path=args.img_file_path,
+        identity_image_path=args.identity_image_path,
         is_upscale=args.is_upscale,
         is_frame_interpolation=args.is_frame_interpolation,
+        num_frames=args.num_frames,
+        enable_model_cpu_offload=args.enable_model_cpu_offload,
+        enable_sequential_cpu_offload=args.enable_sequential_cpu_offload,
+        enable_vae_slicing=args.enable_vae_slicing,
+        enable_vae_tiling=args.enable_vae_tiling,
     )
