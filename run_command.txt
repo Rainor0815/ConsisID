@@ -2,24 +2,13 @@ export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
 
 python infer.py \
   --model_path ckpts \
-  --identity_image_path "./taylor_swift_clean.png" \
-  --prompt "cinematic portrait video of a person in natural lighting" \
+  --identity_image_path asserts/example_images/5.png \
+  --save_identity_memory identity_memory.pt \
   --seed 42 \
-  --dtype float16 \
-  --num_frames 25
-
-python infer.py \
-  --model_path ckpts \
-  --identity_image_path "./taylor_swift_clean.png" \
-  --output_path output \
-  --seed 42 \
-  --num_inference_steps 50 \
-  --guidance_scale 6.0 \
   --prompt "A woman smiling softly at the camera. She maintains gentle eye contact and natural facial expressions while standing in a softly lit environment. The camera is steady, medium close-up, realistic cinematic style."
 
 python infer.py \
---model_path ckpts \
---identity_image_path asserts/example_images/5.png \
---save_identity_memory identity_memory.pt \
---seed 42
---prompt "A woman smiling softly at the camera. She maintains gentle eye contact and natural facial expressions while standing in a softly lit environment. The camera is steady, medium close-up, realistic cinematic style."
+  --model_path ckpts \
+  --load_identity_memory identity_memory.pt \
+  --seed 42 \
+  --prompt "A woman standing in a rainy Tokyo street at night, softly smiling at the camera. Neon lights reflect on the wet pavement, cinematic realistic style."
