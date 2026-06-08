@@ -8,7 +8,7 @@ from huggingface_hub import hf_hub_download, snapshot_download
 from diffusers.image_processor import VaeImageProcessor
 from diffusers.training_utils import free_memory
 from diffusers.utils import export_to_video
-from PIL import Image
+from PIL import Image, ImageOps
 
 from models.consisid_utils import prepare_face_models, process_face_embeddings_infer
 from models.pipeline_consisid import ConsisIDPipeline
@@ -40,6 +40,63 @@ def _validate_identity_png(identity_image_path: str):
     with Image.open(identity_image_path) as img:
         img.convert("RGB")
 
+
+# Identity-memory helpers: keep this payload aligned with the tensors passed into ConsisIDPipeline.
+def _tensor_summary(name, value):
+    if torch.is_tensor(value):
+        return f"{name}: shape={tuple(value.shape)}, dtype={value.dtype}, device={value.device}"
+    if isinstance(value, (list, tuple)):
+        lines = [f"{name}: list[{len(value)}]"]
+        for idx, item in enumerate(value):
+            lines.append(_tensor_summary(f"{name}[{idx}]", item))
+        return "\n".join(lines)
+    if isinstance(value, np.ndarray):
+        return f"{name}: shape={value.shape}, dtype={value.dtype}, device=n/a"
+    return f"{name}: type={type(value).__name__}"
+
+
+def _debug_print_identity_tensors(identity_tensors):
+    print("Identity conditioning tensors:")
+    for name, value in identity_tensors.items():
+        print(f"  {_tensor_summary(name, value).replace(chr(10), chr(10) + '  ')}")
+
+
+def _save_identity_memory(path, id_cond, id_vit_hidden, image, face_kps):
+    # Store CPU tensors so the memory can be reloaded on any device/dtype later.
+    id_cond_cpu = id_cond.detach().cpu()
+    payload = {
+        "format": "consisid_identity_memory_v1",
+        "id_cond": id_cond_cpu,
+        "id_ante_embedding": id_cond_cpu[:, :512],
+        "id_cond_vit": id_cond_cpu[:, 512:],
+        "id_vit_hidden": [tensor.detach().cpu() for tensor in id_vit_hidden],
+        "face_kps": torch.as_tensor(face_kps).detach().cpu(),
+        "conditioning_image": torch.from_numpy(np.array(image.convert("RGB"))).cpu(),
+    }
+    os.makedirs(os.path.dirname(os.path.abspath(path)), exist_ok=True)
+    torch.save(payload, path)
+    print(f"Saved identity memory to: {path}")
+
+
+def _load_identity_memory(path, device, dtype):
+    # Rehydrate the exact pipeline inputs and skip all reference-image face extraction.
+    try:
+        payload = torch.load(path, map_location="cpu", weights_only=True)
+    except TypeError:
+        payload = torch.load(path, map_location="cpu")
+
+    if payload.get("format") != "consisid_identity_memory_v1":
+        raise ValueError(f"Unsupported identity memory format in: {path}")
+
+    id_cond = payload["id_cond"].to(device=device, dtype=dtype)
+    id_vit_hidden = [tensor.to(device=device, dtype=dtype) for tensor in payload["id_vit_hidden"]]
+    face_kps = payload["face_kps"].cpu()
+    image_array = payload["conditioning_image"].cpu().numpy().astype(np.uint8)
+    image = ImageOps.exif_transpose(Image.fromarray(image_array))
+    print(f"Loaded identity memory from: {path}")
+    return id_cond, id_vit_hidden, image, face_kps
+
+
 def generate_video(
     prompt: str,
     model_path: str,
@@ -61,6 +118,8 @@ def generate_video(
     enable_sequential_cpu_offload: bool = False,
     enable_vae_slicing: bool = True,
     enable_vae_tiling: bool = True,
+    save_identity_memory: str = None,
+    load_identity_memory: str = None,
 ):
     """
     Generates a video based on the given prompt and saves it to the specified path.
@@ -85,7 +144,8 @@ def generate_video(
     device = "cuda"
     # Backward compatibility for old CLI flag.
     identity_image_path = identity_image_path or img_file_path
-    _validate_identity_png(identity_image_path)
+    if load_identity_memory is None:
+        _validate_identity_png(identity_image_path)
 
     # Keep generation stable across runs when seed is set.
     if seed is not None:
@@ -107,8 +167,9 @@ def generate_video(
         subfolder = "transformer"
 
 
-    # 1. Prepare all the face models
-    face_helper_1, face_helper_2, face_clip_model, face_main_model, eva_transform_mean, eva_transform_std = prepare_face_models(model_path, device, dtype)
+    # 1. Prepare face models only when extracting identity from a reference image.
+    if load_identity_memory is None:
+        face_helper_1, face_helper_2, face_clip_model, face_main_model, eva_transform_mean, eva_transform_std = prepare_face_models(model_path, device, dtype)
 
 
     # 2. Load Pipeline.
@@ -134,11 +195,27 @@ def generate_video(
         pipe.vae.enable_tiling()
 
 
-    # 4. Prepare model input
-    id_cond, id_vit_hidden, image, face_kps = process_face_embeddings_infer(face_helper_1, face_clip_model, face_helper_2,
-                                                                            eva_transform_mean, eva_transform_std,
-                                                                            face_main_model, device, dtype,
-                                                                            identity_image_path, is_align_face=True)
+    # 4. Prepare model input, either by extraction or by reusing a saved identity memory.
+    if load_identity_memory is not None:
+        id_cond, id_vit_hidden, image, face_kps = _load_identity_memory(load_identity_memory, device, dtype)
+    else:
+        id_cond, id_vit_hidden, image, face_kps = process_face_embeddings_infer(face_helper_1, face_clip_model, face_helper_2,
+                                                                                eva_transform_mean, eva_transform_std,
+                                                                                face_main_model, device, dtype,
+                                                                                identity_image_path, is_align_face=True)
+        if save_identity_memory is not None:
+            _save_identity_memory(save_identity_memory, id_cond, id_vit_hidden, image, face_kps)
+
+    _debug_print_identity_tensors(
+        {
+            "id_cond": id_cond,
+            "id_ante_embedding": id_cond[:, :512],
+            "id_cond_vit": id_cond[:, 512:],
+            "id_vit_hidden": id_vit_hidden,
+            "face_kps": face_kps,
+            "conditioning_image": torch.from_numpy(np.array(image.convert("RGB"))),
+        }
+    )
 
     prompt = prompt.strip('"')
     if negative_prompt:
@@ -202,6 +279,8 @@ if __name__ == "__main__":
     # input arguments
     parser.add_argument("--identity_image_path", type=str, default="asserts/example_images/2.png", help="Path to PNG identity reference image used for identity replacement.")
     parser.add_argument("--img_file_path", type=str, default=None, help="Deprecated alias for --identity_image_path.")
+    parser.add_argument("--save_identity_memory", type=str, default=None, help="Save extracted identity conditioning tensors to this .pt file.")
+    parser.add_argument("--load_identity_memory", type=str, default=None, help="Load identity conditioning tensors from this .pt file and skip reference-image extraction.")
     parser.add_argument("--prompt", type=str, default="The video captures a boy walking along a city street, filmed in black and white on a classic 35mm camera. His expression is thoughtful, his brow slightly furrowed as if he's lost in contemplation. The film grain adds a textured, timeless quality to the image, evoking a sense of nostalgia. Around him, the cityscape is filled with vintage buildings, cobblestone sidewalks, and softly blurred figures passing by, their outlines faint and indistinct. Streetlights cast a gentle glow, while shadows play across the boy's path, adding depth to the scene. The lighting highlights the boy's subtle smile, hinting at a fleeting moment of curiosity. The overall cinematic atmosphere, complete with classic film still aesthetics and dramatic contrasts, gives the scene an evocative and introspective feel.")
     parser.add_argument("--negative_prompt", type=str, default=None, help="Specify a negative prompt to guide the generation model away from certain undesired features or content.")
     # output arguments
@@ -262,4 +341,6 @@ if __name__ == "__main__":
         enable_sequential_cpu_offload=args.enable_sequential_cpu_offload,
         enable_vae_slicing=args.enable_vae_slicing,
         enable_vae_tiling=args.enable_vae_tiling,
+        save_identity_memory=args.save_identity_memory,
+        load_identity_memory=args.load_identity_memory,
     )
