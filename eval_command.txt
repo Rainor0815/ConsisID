@@ -12,3 +12,18 @@ python eval/arcface_identity_stability.py \
   --identity_image_path asserts/example_images/5.png \
   --chunk_size 49 \
   --sample_stride 1
+
+python tools/identity_memory_bank.py \
+  --input_identity_memory identity_memory.pt \
+  --bank_path identity_memory_bank.pt \
+  --source asserts/example_images/5.png
+
+python eval/run_identity_persistence_experiment.py \
+  --model_path ckpts \
+  --identity_memory_path identity_memory.pt \
+  --episodic_identity_memory_path identity_memory_bank.pt \
+  --output_dir output/identity_persistence \
+  --modes baseline episodic \
+  --categories realistic stylized \
+  --seeds 42 \
+  --execute

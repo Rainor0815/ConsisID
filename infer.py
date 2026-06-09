@@ -13,6 +13,12 @@ from PIL import Image, ImageOps
 from models.consisid_utils import prepare_face_models, process_face_embeddings_infer
 from models.pipeline_consisid import ConsisIDPipeline
 from models.transformer_consisid import ConsisIDTransformer3DModel
+from util.identity_memory import (
+    append_identity_episode,
+    blend_identity_conditioning,
+    make_identity_episode,
+    retrieve_identity_episodes,
+)
 from util.rife_model import load_rife_model, rife_inference_with_latents
 from util.utils import load_sd_upscale, upscale_batch_and_concatenate
 
@@ -120,6 +126,12 @@ def generate_video(
     enable_vae_tiling: bool = True,
     save_identity_memory: str = None,
     load_identity_memory: str = None,
+    episodic_identity_memory_path: str = None,
+    episodic_top_k: int = 3,
+    episodic_min_similarity: float = 0.45,
+    episodic_base_weight: float = 1.0,
+    episodic_update_memory: bool = False,
+    episodic_memory_max_episodes: int = 64,
 ):
     """
     Generates a video based on the given prompt and saves it to the specified path.
@@ -206,6 +218,43 @@ def generate_video(
         if save_identity_memory is not None:
             _save_identity_memory(save_identity_memory, id_cond, id_vit_hidden, image, face_kps)
 
+    raw_id_cond = id_cond
+    raw_id_vit_hidden = id_vit_hidden
+    if episodic_identity_memory_path is not None:
+        retrieved_identity = retrieve_identity_episodes(
+            episodic_identity_memory_path,
+            raw_id_cond,
+            top_k=episodic_top_k,
+            min_similarity=episodic_min_similarity,
+        )
+        id_cond, id_vit_hidden, memory_debug = blend_identity_conditioning(
+            raw_id_cond,
+            raw_id_vit_hidden,
+            retrieved_identity,
+            base_weight=episodic_base_weight,
+        )
+        print(f"Episodic identity memory retrieval: {memory_debug}")
+        if episodic_update_memory:
+            episode = make_identity_episode(
+                raw_id_cond,
+                raw_id_vit_hidden,
+                image,
+                face_kps,
+                source=identity_image_path or load_identity_memory,
+                metadata={
+                    "prompt": prompt,
+                    "seed": seed,
+                    "memory_debug": memory_debug,
+                },
+            )
+            num_episodes = append_identity_episode(
+                episodic_identity_memory_path,
+                episode,
+                max_episodes=episodic_memory_max_episodes,
+                metadata={"note": "ConsisID episodic identity memory bank"},
+            )
+            print(f"Updated episodic identity memory bank: {episodic_identity_memory_path} ({num_episodes} episodes)")
+
     _debug_print_identity_tensors(
         {
             "id_cond": id_cond,
@@ -281,6 +330,12 @@ if __name__ == "__main__":
     parser.add_argument("--img_file_path", type=str, default=None, help="Deprecated alias for --identity_image_path.")
     parser.add_argument("--save_identity_memory", type=str, default=None, help="Save extracted identity conditioning tensors to this .pt file.")
     parser.add_argument("--load_identity_memory", type=str, default=None, help="Load identity conditioning tensors from this .pt file and skip reference-image extraction.")
+    parser.add_argument("--episodic_identity_memory_path", type=str, default=None, help="Optional identity memory bank used to retrieve and blend historical identity episodes.")
+    parser.add_argument("--episodic_top_k", type=int, default=3, help="Number of retrieved identity episodes to blend into conditioning.")
+    parser.add_argument("--episodic_min_similarity", type=float, default=0.45, help="Minimum combined ArcFace/EVA similarity required for identity memory retrieval.")
+    parser.add_argument("--episodic_base_weight", type=float, default=1.0, help="Weight assigned to the current identity features before blending retrieved memories.")
+    parser.add_argument("--episodic_update_memory", action="store_true", help="Append the current identity features to the episodic memory bank before generation.")
+    parser.add_argument("--episodic_memory_max_episodes", type=int, default=64, help="Maximum number of episodes retained in the identity memory bank.")
     parser.add_argument("--prompt", type=str, default="The video captures a boy walking along a city street, filmed in black and white on a classic 35mm camera. His expression is thoughtful, his brow slightly furrowed as if he's lost in contemplation. The film grain adds a textured, timeless quality to the image, evoking a sense of nostalgia. Around him, the cityscape is filled with vintage buildings, cobblestone sidewalks, and softly blurred figures passing by, their outlines faint and indistinct. Streetlights cast a gentle glow, while shadows play across the boy's path, adding depth to the scene. The lighting highlights the boy's subtle smile, hinting at a fleeting moment of curiosity. The overall cinematic atmosphere, complete with classic film still aesthetics and dramatic contrasts, gives the scene an evocative and introspective feel.")
     parser.add_argument("--negative_prompt", type=str, default=None, help="Specify a negative prompt to guide the generation model away from certain undesired features or content.")
     # output arguments
@@ -343,4 +398,10 @@ if __name__ == "__main__":
         enable_vae_tiling=args.enable_vae_tiling,
         save_identity_memory=args.save_identity_memory,
         load_identity_memory=args.load_identity_memory,
+        episodic_identity_memory_path=args.episodic_identity_memory_path,
+        episodic_top_k=args.episodic_top_k,
+        episodic_min_similarity=args.episodic_min_similarity,
+        episodic_base_weight=args.episodic_base_weight,
+        episodic_update_memory=args.episodic_update_memory,
+        episodic_memory_max_episodes=args.episodic_memory_max_episodes,
     )

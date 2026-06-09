@@ -105,6 +105,33 @@ def _chunk_rows(frame_rows: List[Dict], chunk_size: int) -> List[Dict]:
     return chunk_rows
 
 
+def _similarity_decay_summary(chunk_rows: List[Dict]) -> Dict:
+    valid_chunks = [row for row in chunk_rows if row["mean_similarity"] is not None]
+    if not valid_chunks:
+        return {
+            "first_chunk_mean_similarity": None,
+            "last_chunk_mean_similarity": None,
+            "chunk_similarity_decay": None,
+            "chunk_mean_similarity_slope": None,
+        }
+
+    first = valid_chunks[0]["mean_similarity"]
+    last = valid_chunks[-1]["mean_similarity"]
+    if len(valid_chunks) >= 2:
+        x = np.asarray([row["chunk_index"] for row in valid_chunks], dtype=np.float32)
+        y = np.asarray([row["mean_similarity"] for row in valid_chunks], dtype=np.float32)
+        slope = float(np.polyfit(x, y, 1)[0])
+    else:
+        slope = None
+
+    return {
+        "first_chunk_mean_similarity": first,
+        "last_chunk_mean_similarity": last,
+        "chunk_similarity_decay": float(last - first) if first is not None and last is not None else None,
+        "chunk_mean_similarity_slope": slope,
+    }
+
+
 def _write_csv(path: str, rows: List[Dict]):
     if not rows:
         return
@@ -182,6 +209,7 @@ def evaluate_arcface_identity_stability(
     cap.release()
 
     chunk_rows = _chunk_rows(frame_rows, chunk_size)
+    decay_summary = _similarity_decay_summary(chunk_rows)
     detected_scores = [row["arcface_similarity"] for row in frame_rows if row["face_detected"]]
     summary = {
         "video_path": video_path,
@@ -203,6 +231,7 @@ def evaluate_arcface_identity_stability(
             key=lambda row: row["mean_similarity"],
             default=None,
         ),
+        **decay_summary,
     }
 
     output_dir = output_dir or os.path.splitext(video_path)[0] + "_arcface_identity"

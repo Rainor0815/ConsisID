@@ -1,0 +1,38 @@
+{
+  "realistic": [
+    {
+      "name": "steady_portrait",
+      "prompt": "A person smiling softly at the camera. They maintain gentle eye contact and natural facial expressions while standing in a softly lit environment. The camera is steady, medium close-up, realistic cinematic style."
+    },
+    {
+      "name": "viewpoint_turn",
+      "prompt": "A person slowly turns from a three-quarter side profile toward the camera and smiles naturally. Soft studio lighting, realistic cinematic portrait, subtle head motion."
+    },
+    {
+      "name": "occlusion_reappearance",
+      "prompt": "A person walks through a busy city street at night. Passing pedestrians briefly occlude the face before the person reappears and looks toward the camera, realistic cinematic style."
+    },
+    {
+      "name": "background_shift",
+      "prompt": "A person standing in a rainy Tokyo street at night, softly smiling at the camera. Neon lights reflect on the wet pavement, cinematic realistic style."
+    }
+  ],
+  "stylized": [
+    {
+      "name": "anime_portrait",
+      "prompt": "An anime-style person smiling warmly at the camera. Soft lighting, detailed eyes, gentle facial expressions, cinematic anime aesthetic."
+    },
+    {
+      "name": "manga_panel",
+      "prompt": "A black-and-white manga-style close-up of a person turning toward the camera with expressive eyes and clean ink shading. Subtle motion, consistent facial structure."
+    },
+    {
+      "name": "game_character",
+      "prompt": "A stylized game-like character version of the person standing under colorful city lights, smiling softly at the camera, high-quality 3D character render."
+    },
+    {
+      "name": "painterly",
+      "prompt": "A painterly cinematic portrait of a person by a window during sunset, smiling softly at the camera. Brush-textured stylization while preserving facial identity."
+    }
+  ]
+}
