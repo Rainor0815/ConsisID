@@ -1,0 +1,20 @@
+{
+  "realistic": [
+    {
+      "name": "steady_portrait",
+      "prompt": "A person smiling softly at the camera. They maintain gentle eye contact and natural facial expressions while standing in a softly lit environment. The camera is steady, medium close-up, realistic cinematic style."
+    },
+    {
+      "name": "viewpoint_turn",
+      "prompt": "A person slowly turns from a three-quarter side profile toward the camera and smiles naturally. Soft studio lighting, realistic cinematic portrait, subtle head motion."
+    },
+    {
+      "name": "occlusion_reappearance",
+      "prompt": "A person walks through a busy city street at night. Passing pedestrians briefly occlude the face before the person reappears and looks toward the camera, realistic cinematic style."
+    },
+    {
+      "name": "background_shift",
+      "prompt": "A person standing in a rainy Tokyo street at night, softly smiling at the camera. Neon lights reflect on the wet pavement, cinematic realistic style."
+    }
+  ]
+}

@@ -69,11 +69,11 @@ def _load_reference_embedding(
     return face_info["embedding"]
 
 
-def _frame_embedding(face_model: FaceAnalysis, frame_bgr: np.ndarray) -> Tuple[Optional[np.ndarray], Optional[np.ndarray]]:
+def _frame_embedding(face_model: FaceAnalysis, frame_bgr: np.ndarray) -> Tuple[Optional[np.ndarray], Optional[np.ndarray], Optional[float]]:
     face_info = _largest_face(face_model.get(frame_bgr))
     if face_info is None:
-        return None, None
-    return face_info["embedding"], face_info["bbox"]
+        return None, None, None
+    return face_info["embedding"], face_info["bbox"], float(face_info.get("det_score", 0.0))
 
 
 def _chunk_rows(frame_rows: List[Dict], chunk_size: int) -> List[Dict]:
@@ -85,6 +85,7 @@ def _chunk_rows(frame_rows: List[Dict], chunk_size: int) -> List[Dict]:
     for chunk_index in sorted(chunks):
         rows = chunks[chunk_index]
         similarities = [row["arcface_similarity"] for row in rows if row["face_detected"]]
+        face_area_ratios = [row["bbox_area_ratio"] for row in rows if row["face_detected"] and row["bbox_area_ratio"] is not None]
         detected = len(similarities)
         total = len(rows)
         chunk_rows.append(
@@ -99,10 +100,24 @@ def _chunk_rows(frame_rows: List[Dict], chunk_size: int) -> List[Dict]:
                 "mean_similarity": float(np.mean(similarities)) if similarities else None,
                 "min_similarity": float(np.min(similarities)) if similarities else None,
                 "max_similarity": float(np.max(similarities)) if similarities else None,
+                "mean_face_area_ratio": float(np.mean(face_area_ratios)) if face_area_ratios else None,
+                "min_face_area_ratio": float(np.min(face_area_ratios)) if face_area_ratios else None,
                 "chunk_size": chunk_size,
             }
         )
     return chunk_rows
+
+
+def _max_consecutive_missing(frame_rows: List[Dict]) -> int:
+    max_missing = 0
+    current = 0
+    for row in frame_rows:
+        if row["face_detected"]:
+            current = 0
+        else:
+            current += 1
+            max_missing = max(max_missing, current)
+    return max_missing
 
 
 def _similarity_decay_summary(chunk_rows: List[Dict]) -> Dict:
@@ -186,9 +201,19 @@ def evaluate_arcface_identity_stability(
             frame_index += 1
             continue
 
-        frame_embedding, bbox = _frame_embedding(face_model, frame_bgr)
+        frame_embedding, bbox, det_score = _frame_embedding(face_model, frame_bgr)
         similarity = _cosine_similarity(reference_embedding, frame_embedding) if frame_embedding is not None else None
         x1, y1, x2, y2 = bbox.tolist() if bbox is not None else (None, None, None, None)
+        frame_height, frame_width = frame_bgr.shape[:2]
+        bbox_area_ratio = None
+        bbox_center_x = None
+        bbox_center_y = None
+        if bbox is not None:
+            bbox_width = max(float(x2 - x1), 0.0)
+            bbox_height = max(float(y2 - y1), 0.0)
+            bbox_area_ratio = (bbox_width * bbox_height) / float(frame_width * frame_height)
+            bbox_center_x = ((float(x1) + float(x2)) / 2.0) / float(frame_width)
+            bbox_center_y = ((float(y1) + float(y2)) / 2.0) / float(frame_height)
 
         # Chunk index is based on real frame position, so skipped sampling still maps to generated segments.
         frame_rows.append(
@@ -197,11 +222,15 @@ def evaluate_arcface_identity_stability(
                 "time_seconds": frame_index / fps if fps > 0 else None,
                 "chunk_index": frame_index // chunk_size,
                 "face_detected": frame_embedding is not None,
+                "face_det_score": det_score,
                 "arcface_similarity": similarity,
                 "bbox_x1": x1,
                 "bbox_y1": y1,
                 "bbox_x2": x2,
                 "bbox_y2": y2,
+                "bbox_area_ratio": bbox_area_ratio,
+                "bbox_center_x": bbox_center_x,
+                "bbox_center_y": bbox_center_y,
             }
         )
         frame_index += 1
@@ -211,6 +240,9 @@ def evaluate_arcface_identity_stability(
     chunk_rows = _chunk_rows(frame_rows, chunk_size)
     decay_summary = _similarity_decay_summary(chunk_rows)
     detected_scores = [row["arcface_similarity"] for row in frame_rows if row["face_detected"]]
+    face_area_ratios = [row["bbox_area_ratio"] for row in frame_rows if row["face_detected"] and row["bbox_area_ratio"] is not None]
+    face_center_xs = [row["bbox_center_x"] for row in frame_rows if row["face_detected"] and row["bbox_center_x"] is not None]
+    face_center_ys = [row["bbox_center_y"] for row in frame_rows if row["face_detected"] and row["bbox_center_y"] is not None]
     summary = {
         "video_path": video_path,
         "identity_image_path": identity_image_path,
@@ -226,6 +258,12 @@ def evaluate_arcface_identity_stability(
         "max_similarity": float(np.max(detected_scores)) if detected_scores else None,
         "chunk_size": chunk_size,
         "num_chunks": len(chunk_rows),
+        "zero_face_chunks": sum(1 for row in chunk_rows if row["detected_frames"] == 0),
+        "max_consecutive_missing_frames": _max_consecutive_missing(frame_rows),
+        "mean_face_area_ratio": float(np.mean(face_area_ratios)) if face_area_ratios else None,
+        "min_face_area_ratio": float(np.min(face_area_ratios)) if face_area_ratios else None,
+        "face_center_std_x": float(np.std(face_center_xs)) if face_center_xs else None,
+        "face_center_std_y": float(np.std(face_center_ys)) if face_center_ys else None,
         "lowest_similarity_chunk": min(
             (row for row in chunk_rows if row["mean_similarity"] is not None),
             key=lambda row: row["mean_similarity"],

@@ -134,6 +134,9 @@ def generate_video(
     episodic_exact_match_epsilon: float = 0.0,
     episodic_update_memory: bool = False,
     episodic_memory_max_episodes: int = 64,
+    local_face_scale: float = None,
+    prompt_enhancement_suffix: str = None,
+    negative_prompt_append: str = None,
 ):
     """
     Generates a video based on the given prompt and saves it to the specified path.
@@ -188,6 +191,10 @@ def generate_video(
 
     # 2. Load Pipeline.
     transformer = ConsisIDTransformer3DModel.from_pretrained(model_path, subfolder=subfolder, torch_dtype=dtype)
+    if local_face_scale is not None:
+        previous_scale = getattr(transformer, "local_face_scale", None)
+        transformer.local_face_scale = float(local_face_scale)
+        print(f"Set transformer.local_face_scale: {previous_scale} -> {transformer.local_face_scale}")
     pipe = ConsisIDPipeline.from_pretrained(model_path, transformer=transformer, torch_dtype=dtype)
 
     # If you're using with lora, add this code
@@ -275,6 +282,11 @@ def generate_video(
         }
     )
 
+    if prompt_enhancement_suffix:
+        prompt = f"{prompt.rstrip()} {prompt_enhancement_suffix.strip()}"
+    if negative_prompt_append:
+        negative_prompt = f"{(negative_prompt or '').rstrip()} {negative_prompt_append.strip()}".strip()
+
     prompt = prompt.strip('"')
     if negative_prompt:
         negative_prompt = negative_prompt.strip('"')
@@ -349,6 +361,8 @@ if __name__ == "__main__":
     parser.add_argument("--episodic_memory_max_episodes", type=int, default=64, help="Maximum number of episodes retained in the identity memory bank.")
     parser.add_argument("--prompt", type=str, default="The video captures a boy walking along a city street, filmed in black and white on a classic 35mm camera. His expression is thoughtful, his brow slightly furrowed as if he's lost in contemplation. The film grain adds a textured, timeless quality to the image, evoking a sense of nostalgia. Around him, the cityscape is filled with vintage buildings, cobblestone sidewalks, and softly blurred figures passing by, their outlines faint and indistinct. Streetlights cast a gentle glow, while shadows play across the boy's path, adding depth to the scene. The lighting highlights the boy's subtle smile, hinting at a fleeting moment of curiosity. The overall cinematic atmosphere, complete with classic film still aesthetics and dramatic contrasts, gives the scene an evocative and introspective feel.")
     parser.add_argument("--negative_prompt", type=str, default=None, help="Specify a negative prompt to guide the generation model away from certain undesired features or content.")
+    parser.add_argument("--prompt_enhancement_suffix", type=str, default=None, help="Append a face-preservation suffix to the prompt for recovery attempts.")
+    parser.add_argument("--negative_prompt_append", type=str, default=None, help="Append face-loss terms to the negative prompt for recovery attempts.")
     # output arguments
     parser.add_argument("--output_path", type=str, default="./output", help="The path where the generated video will be saved")
     # generation arguments
@@ -365,6 +379,7 @@ if __name__ == "__main__":
     parser.add_argument("--enable_sequential_cpu_offload", action='store_true', help="Enable sequential CPU offload for maximum VRAM savings.")
     parser.add_argument("--enable_vae_slicing", action=argparse.BooleanOptionalAction, default=True, help="Enable VAE slicing to reduce VAE memory usage.")
     parser.add_argument("--enable_vae_tiling", action=argparse.BooleanOptionalAction, default=True, help="Enable VAE tiling to reduce VAE memory usage.")
+    parser.add_argument("--local_face_scale", type=float, default=None, help="Override transformer.local_face_scale at inference time.")
 
     args = parser.parse_args()
 
@@ -417,4 +432,7 @@ if __name__ == "__main__":
         episodic_exact_match_epsilon=args.episodic_exact_match_epsilon,
         episodic_update_memory=args.episodic_update_memory,
         episodic_memory_max_episodes=args.episodic_memory_max_episodes,
+        local_face_scale=args.local_face_scale,
+        prompt_enhancement_suffix=args.prompt_enhancement_suffix,
+        negative_prompt_append=args.negative_prompt_append,
     )

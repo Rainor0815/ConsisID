@@ -112,6 +112,8 @@ def main():
                     "accepted": False,
                     "reason": "segment_guard_failed",
                     "arcface_similarity": segment_mean if segment_mean is not None else "",
+                    "face_det_score": "",
+                    "bbox_area_ratio": "",
                     "crop_path": "",
                 }
             ],
@@ -142,6 +144,8 @@ def main():
                     "accepted": False,
                     "reason": "no_frame_passed_similarity_guard",
                     "arcface_similarity": "",
+                    "face_det_score": "",
+                    "bbox_area_ratio": "",
                     "crop_path": "",
                 }
             ],
@@ -207,6 +211,8 @@ def main():
                     "accepted": True,
                     "reason": "accepted",
                     "arcface_similarity": similarity,
+                    "face_det_score": row.get("face_det_score", ""),
+                    "bbox_area_ratio": row.get("bbox_area_ratio", ""),
                     "crop_path": str(crop_path),
                 }
             )
@@ -217,6 +223,8 @@ def main():
                     "accepted": False,
                     "reason": f"extract_failed:{type(exc).__name__}:{exc}",
                     "arcface_similarity": similarity,
+                    "face_det_score": row.get("face_det_score", ""),
+                    "bbox_area_ratio": row.get("bbox_area_ratio", ""),
                     "crop_path": "",
                 }
             )

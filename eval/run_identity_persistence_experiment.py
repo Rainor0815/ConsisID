@@ -14,6 +14,16 @@ import torch
 
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
+if str(PROJECT_ROOT) not in sys.path:
+    sys.path.insert(0, str(PROJECT_ROOT))
+
+from util.face_recovery import (
+    RecoveryProfile,
+    build_recovery_profiles,
+    format_recovery_reason,
+    rank_segment_attempt,
+    segment_passes_face_guard,
+)
 
 
 def _load_prompt_suite(path: Path) -> Dict[str, List[Dict[str, str]]]:
@@ -85,9 +95,11 @@ def _build_infer_command(
     prompt: str,
     output_dir: Path,
     seed: int,
+    negative_prompt: Optional[str] = None,
     episodic_identity_memory_path: Optional[str] = None,
     episodic_top_k: Optional[int] = None,
     episodic_base_weight: Optional[float] = None,
+    local_face_scale: Optional[float] = None,
 ) -> List[str]:
     command = [
         sys.executable,
@@ -109,6 +121,10 @@ def _build_infer_command(
         "--dtype",
         args.dtype,
     ]
+    if negative_prompt:
+        command.extend(["--negative_prompt", negative_prompt])
+    if local_face_scale is not None:
+        command.extend(["--local_face_scale", str(local_face_scale)])
 
     if args.identity_memory_path:
         command.extend(["--load_identity_memory", args.identity_memory_path])
@@ -217,6 +233,67 @@ def _segment_quality_key(summary: Dict):
         _summary_metric(summary.get("mean_similarity")),
         _summary_metric(summary.get("min_similarity")),
     )
+
+
+def _segment_passes_active_guard(summary: Dict, args) -> bool:
+    if args.face_recovery:
+        return segment_passes_face_guard(
+            summary,
+            args.face_recovery_min_detection_rate,
+            args.face_recovery_min_mean_similarity,
+            args.face_recovery_min_frame_similarity,
+        )
+    return not _segment_needs_rerun(summary, args)
+
+
+def _active_guard_reason(summary: Dict, args) -> str:
+    if args.face_recovery:
+        return format_recovery_reason(
+            summary,
+            args.face_recovery_min_detection_rate,
+            args.face_recovery_min_mean_similarity,
+            args.face_recovery_min_frame_similarity,
+        )
+    return "failed_guard" if _segment_needs_rerun(summary, args) else ""
+
+
+def _active_attempt_key(summary: Dict, args):
+    if args.face_recovery:
+        return rank_segment_attempt(summary)
+    return _segment_quality_key(summary)
+
+
+def _build_attempt_profiles(args, prompt: str, negative_prompt: Optional[str], segment_index: int, mode: str) -> List[RecoveryProfile]:
+    if mode == "episodic" and args.face_recovery:
+        return build_recovery_profiles(prompt, negative_prompt, segment_index, args)
+
+    max_attempts = 1 + (args.rerun_max_attempts if args.rerun_failed_segments and mode == "episodic" else 0)
+    profiles = [
+        RecoveryProfile(
+            attempt_index=0,
+            name="initial",
+            prompt=prompt,
+            negative_prompt=negative_prompt,
+            seed_offset=0,
+            episodic_top_k=None,
+            episodic_base_weight=None,
+            local_face_scale=None,
+        )
+    ]
+    for attempt_index in range(1, max_attempts):
+        profiles.append(
+            RecoveryProfile(
+                attempt_index=attempt_index,
+                name=f"rerun_{attempt_index:02d}",
+                prompt=prompt,
+                negative_prompt=negative_prompt,
+                seed_offset=0,
+                episodic_top_k=args.rerun_top_k,
+                episodic_base_weight=args.rerun_base_weight,
+                local_face_scale=None,
+            )
+        )
+    return profiles
 
 
 def _segment_needs_rerun(summary: Dict, args) -> bool:
@@ -477,6 +554,7 @@ def main():
     parser.add_argument("--segments", type=int, default=3)
     parser.add_argument("--num_inference_steps", type=int, default=50)
     parser.add_argument("--guidance_scale", type=float, default=6.0)
+    parser.add_argument("--negative_prompt", type=str, default=None)
     parser.add_argument("--dtype", type=str, default="bfloat16", choices=["bfloat16", "float16"])
     parser.add_argument("--episodic_top_k", type=int, default=3)
     parser.add_argument("--episodic_min_similarity", type=float, default=0.45)
@@ -511,6 +589,18 @@ def main():
     parser.add_argument("--rerun_min_frame_similarity", type=float, default=0.35)
     parser.add_argument("--rerun_base_weight", type=float, default=None)
     parser.add_argument("--rerun_top_k", type=int, default=None)
+    parser.add_argument("--face_recovery", action="store_true")
+    parser.add_argument("--face_recovery_max_attempts", type=int, default=3)
+    parser.add_argument("--face_recovery_min_detection_rate", type=float, default=0.5)
+    parser.add_argument("--face_recovery_min_mean_similarity", type=float, default=0.45)
+    parser.add_argument("--face_recovery_min_frame_similarity", type=float, default=0.35)
+    parser.add_argument("--face_recovery_seed_stride", type=int, default=101)
+    parser.add_argument("--face_recovery_prompt_suffix", type=str, default=None)
+    parser.add_argument("--face_recovery_fallback_prompt", type=str, default=None)
+    parser.add_argument("--face_recovery_negative_prompt", type=str, default=None)
+    parser.add_argument("--face_recovery_local_face_scales", type=str, default="default,1.25,1.5")
+    parser.add_argument("--face_recovery_top_ks", type=str, default="6,6")
+    parser.add_argument("--face_recovery_base_weights", type=str, default="0.25,0.2")
     parser.add_argument("--fail_on_validation", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--execute", action="store_true", help="Run commands. Without this flag, only print them.")
     args = parser.parse_args()
@@ -534,7 +624,8 @@ def main():
                     eval_output_dir = output_root / "scores" / run_name
                     segment_eval_root = output_root / "segment_scores" / run_name
                     advanced_segment_controls = (
-                        mode == "episodic" and (args.online_memory_update or args.rerun_failed_segments)
+                        mode == "episodic"
+                        and (args.online_memory_update or args.rerun_failed_segments or args.face_recovery)
                     )
                     video_output_dir.mkdir(parents=True, exist_ok=True)
                     eval_output_dir.mkdir(parents=True, exist_ok=True)
@@ -548,6 +639,7 @@ def main():
                         else args.episodic_identity_memory_path
                     )
                     segment_attempt_rows = []
+                    base_negative_prompt = prompt_case.get("negative_prompt") or args.negative_prompt
 
                     if args.execute:
                         segment_paths = []
@@ -556,31 +648,40 @@ def main():
                             segment_dir.mkdir(parents=True, exist_ok=True)
                             segment_seed = seed + segment_index
                             attempt_summaries = []
-                            max_attempts = 1 + (args.rerun_max_attempts if args.rerun_failed_segments and mode == "episodic" else 0)
-                            for attempt_index in range(max_attempts):
+                            attempt_profiles = _build_attempt_profiles(
+                                args,
+                                prompt_case["prompt"],
+                                base_negative_prompt,
+                                segment_index,
+                                mode,
+                            )
+                            for profile in attempt_profiles:
+                                attempt_index = profile.attempt_index
                                 attempt_dir = (
                                     segment_dir / f"attempt_{attempt_index:02d}"
                                     if advanced_segment_controls
                                     else segment_dir
                                 )
                                 attempt_dir.mkdir(parents=True, exist_ok=True)
+                                attempt_seed = segment_seed + profile.seed_offset
                                 attempt_base_weight = _scheduled_base_weight(args, segment_index)
                                 attempt_top_k = _scheduled_top_k(args, segment_index)
-                                if attempt_index > 0:
-                                    if args.rerun_base_weight is not None:
-                                        attempt_base_weight = args.rerun_base_weight
-                                    if args.rerun_top_k is not None:
-                                        attempt_top_k = args.rerun_top_k
+                                if profile.episodic_base_weight is not None:
+                                    attempt_base_weight = profile.episodic_base_weight
+                                if profile.episodic_top_k is not None:
+                                    attempt_top_k = profile.episodic_top_k
 
                                 infer_command = _build_infer_command(
                                     args,
                                     mode,
-                                    prompt_case["prompt"],
+                                    profile.prompt,
                                     attempt_dir,
-                                    segment_seed,
+                                    attempt_seed,
+                                    negative_prompt=profile.negative_prompt,
                                     episodic_identity_memory_path=memory_path_for_generation,
                                     episodic_top_k=attempt_top_k,
                                     episodic_base_weight=attempt_base_weight,
+                                    local_face_scale=profile.local_face_scale,
                                 )
                                 before = _mp4_set(attempt_dir)
                                 _run(infer_command, PROJECT_ROOT)
@@ -600,18 +701,28 @@ def main():
                                             "run_name": run_name,
                                             "segment_index": segment_index,
                                             "attempt_index": attempt_index,
+                                            "recovery_profile": profile.name,
                                             "video_path": str(attempt_path),
+                                            "attempt_seed": attempt_seed,
+                                            "attempt_seed_offset": profile.seed_offset,
+                                            "negative_prompt": profile.negative_prompt or "",
+                                            "local_face_scale": profile.local_face_scale if profile.local_face_scale is not None else "",
                                             "episodic_memory_path": memory_path_for_generation,
                                             "episodic_top_k": attempt_top_k,
                                             "episodic_base_weight": attempt_base_weight,
                                             "detection_rate": attempt_summary["detection_rate"],
                                             "mean_similarity": attempt_summary["mean_similarity"],
                                             "min_similarity": attempt_summary["min_similarity"],
+                                            "zero_face_chunks": attempt_summary.get("zero_face_chunks"),
+                                            "max_consecutive_missing_frames": attempt_summary.get("max_consecutive_missing_frames"),
+                                            "mean_face_area_ratio": attempt_summary.get("mean_face_area_ratio"),
+                                            "min_face_area_ratio": attempt_summary.get("min_face_area_ratio"),
+                                            "face_guard_passed": _segment_passes_active_guard(attempt_summary, args),
                                             "accepted_attempt": False,
-                                            "rerun_reason": "failed_guard" if _segment_needs_rerun(attempt_summary, args) else "",
+                                            "rerun_reason": _active_guard_reason(attempt_summary, args),
                                         }
                                     )
-                                    if not _segment_needs_rerun(attempt_summary, args):
+                                    if _segment_passes_active_guard(attempt_summary, args):
                                         break
                                 else:
                                     attempt_summaries.append((attempt_path, None, attempt_summary))
@@ -620,7 +731,7 @@ def main():
                             if advanced_segment_controls:
                                 best_path, best_eval_dir, best_summary = max(
                                     attempt_summaries,
-                                    key=lambda item: _segment_quality_key(item[2]),
+                                    key=lambda item: _active_attempt_key(item[2], args),
                                 )
                                 for row in segment_attempt_rows:
                                     if row["run_name"] == run_name and row["segment_index"] == segment_index:
@@ -669,6 +780,12 @@ def main():
                                 "last_chunk_mean_similarity": summary["last_chunk_mean_similarity"],
                                 "chunk_similarity_decay": summary["chunk_similarity_decay"],
                                 "chunk_mean_similarity_slope": summary["chunk_mean_similarity_slope"],
+                                "zero_face_chunks": summary.get("zero_face_chunks"),
+                                "max_consecutive_missing_frames": summary.get("max_consecutive_missing_frames"),
+                                "mean_face_area_ratio": summary.get("mean_face_area_ratio"),
+                                "min_face_area_ratio": summary.get("min_face_area_ratio"),
+                                "face_center_std_x": summary.get("face_center_std_x"),
+                                "face_center_std_y": summary.get("face_center_std_y"),
                             }
                         )
                         if segment_attempt_rows:
@@ -677,20 +794,37 @@ def main():
                         for segment_index in range(args.segments):
                             segment_dir = video_output_dir / f"segment_{segment_index:02d}"
                             segment_seed = seed + segment_index
-                            infer_command = _build_infer_command(
+                            attempt_profiles = _build_attempt_profiles(
                                 args,
-                                mode,
                                 prompt_case["prompt"],
-                                segment_dir,
-                                segment_seed,
-                                episodic_identity_memory_path=memory_path_for_generation,
-                                episodic_top_k=_scheduled_top_k(args, segment_index),
-                                episodic_base_weight=_scheduled_base_weight(args, segment_index),
+                                base_negative_prompt,
+                                segment_index,
+                                mode,
                             )
-                            print(shlex.join(infer_command))
+                            for profile in attempt_profiles:
+                                attempt_dir = (
+                                    segment_dir / f"attempt_{profile.attempt_index:02d}"
+                                    if advanced_segment_controls
+                                    else segment_dir
+                                )
+                                infer_command = _build_infer_command(
+                                    args,
+                                    mode,
+                                    profile.prompt,
+                                    attempt_dir,
+                                    segment_seed + profile.seed_offset,
+                                    negative_prompt=profile.negative_prompt,
+                                    episodic_identity_memory_path=memory_path_for_generation,
+                                    episodic_top_k=profile.episodic_top_k or _scheduled_top_k(args, segment_index),
+                                    episodic_base_weight=profile.episodic_base_weight
+                                    if profile.episodic_base_weight is not None
+                                    else _scheduled_base_weight(args, segment_index),
+                                    local_face_scale=profile.local_face_scale,
+                                )
+                                print(shlex.join(infer_command))
                             if advanced_segment_controls:
                                 print(
-                                    "After this segment, evaluate it, optionally rerun failed attempts, "
+                                    "After this segment, evaluate attempts, optionally run recovery profiles, "
                                     "and run guarded_memory_update_from_video.py for accepted segments."
                                 )
                         joined_placeholder = video_output_dir / f"{seed}_joined_{args.segments}x{args.num_frames}.mp4"
