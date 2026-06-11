@@ -35,6 +35,14 @@ def _cosine_similarity(a: torch.Tensor, b: torch.Tensor) -> float:
     return float(torch.dot(a, b).item() / denom.item())
 
 
+def _max_abs_diff(a: torch.Tensor, b: torch.Tensor) -> float:
+    a = _as_float_tensor(a)
+    b = _as_float_tensor(b)
+    if a.shape != b.shape:
+        return float("inf")
+    return float((a - b).abs().max().item())
+
+
 def _identity_parts(id_cond: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
     id_cond = _as_float_tensor(id_cond)
     return id_cond[:, :512], id_cond[:, 512:]
@@ -126,6 +134,8 @@ def retrieve_identity_episodes(
     query_id_cond: torch.Tensor,
     top_k: int = 3,
     min_similarity: float = 0.45,
+    exclude_exact_match: bool = True,
+    exact_match_epsilon: float = 0.0,
 ) -> List[Dict]:
     if not path or top_k <= 0:
         return []
@@ -133,6 +143,8 @@ def retrieve_identity_episodes(
     query_ante, query_vit = _identity_parts(query_id_cond)
     scored = []
     for episode in load_identity_episodes(path):
+        if exclude_exact_match and _max_abs_diff(query_id_cond, episode["id_cond"]) <= exact_match_epsilon:
+            continue
         arcface_similarity = _cosine_similarity(query_ante, episode["id_ante_embedding"])
         vit_similarity = _cosine_similarity(query_vit, episode["id_cond_vit"])
         score = 0.8 * arcface_similarity + 0.2 * vit_similarity

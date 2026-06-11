@@ -1,13 +1,28 @@
-export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True 
+set -euo pipefail
+cd "$(dirname "$0")"
 
-python infer.py \
+export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
+PYTHON="${PYTHON:-/mnt/share/Rainer/anaconda3/envs/consisid/bin/python}"
+
+"$PYTHON" - <<'PY'
+import sys
+import torch
+
+if not torch.cuda.is_available():
+    sys.exit(
+        "CUDA is not available to this process. ConsisID inference currently requires a visible NVIDIA GPU. "
+        "Check nvidia-smi, driver/container GPU access, and /dev/nvidia* before rerunning."
+    )
+PY
+
+"$PYTHON" infer.py \
   --model_path ckpts \
   --identity_image_path asserts/example_images/5.png \
   --save_identity_memory identity_memory.pt \
   --seed 42 \
   --prompt "A woman smiling softly at the camera. She maintains gentle eye contact and natural facial expressions while standing in a softly lit environment. The camera is steady, medium close-up, realistic cinematic style."
 
-python infer.py \
+"$PYTHON" infer.py \
   --model_path ckpts \
   --load_identity_memory identity_memory.pt \
   --seed 42 \

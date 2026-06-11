@@ -1,11 +1,15 @@
 import argparse
 import csv
+import hashlib
 import json
 import os
+import shlex
 import subprocess
 import sys
 from pathlib import Path
 from typing import Dict, List, Optional
+
+import torch
 
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
@@ -17,8 +21,16 @@ def _load_prompt_suite(path: Path) -> Dict[str, List[Dict[str, str]]]:
 
 
 def _run(command: List[str], cwd: Path):
-    print(" ".join(command))
+    print(shlex.join(command))
     subprocess.run(command, cwd=str(cwd), check=True)
+
+
+def _file_md5(path: Path) -> str:
+    digest = hashlib.md5()
+    with path.open("rb") as handle:
+        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
 
 
 def _mp4_set(output_dir: Path) -> set:
@@ -32,6 +44,38 @@ def _new_video(output_dir: Path, before: set) -> Optional[Path]:
     if not candidates:
         return None
     return max(candidates, key=lambda path: path.stat().st_mtime)
+
+
+def _quote_concat_path(path: Path) -> str:
+    return str(path.resolve()).replace("\\", "\\\\").replace("'", "\\'")
+
+
+def _concat_videos(video_paths: List[Path], output_path: Path) -> Path:
+    if len(video_paths) == 1:
+        return video_paths[0]
+
+    list_path = output_path.with_suffix(".concat.txt")
+    with list_path.open("w", encoding="utf-8") as handle:
+        for video_path in video_paths:
+            handle.write(f"file '{_quote_concat_path(video_path)}'\n")
+
+    _run(
+        [
+            "ffmpeg",
+            "-y",
+            "-f",
+            "concat",
+            "-safe",
+            "0",
+            "-i",
+            str(list_path),
+            "-c",
+            "copy",
+            str(output_path),
+        ],
+        PROJECT_ROOT,
+    )
+    return output_path
 
 
 def _build_infer_command(
@@ -78,6 +122,9 @@ def _build_infer_command(
                 str(args.episodic_min_similarity),
                 "--episodic_base_weight",
                 str(args.episodic_base_weight),
+                "--episodic_exclude_exact_match",
+                "--episodic_exact_match_epsilon",
+                str(args.episodic_exact_match_epsilon),
             ]
         )
 
@@ -113,6 +160,82 @@ def _read_summary(path: Path) -> Dict:
         return json.load(handle)
 
 
+def _safe_torch_load(path: Path) -> Dict:
+    try:
+        return torch.load(path, map_location="cpu", weights_only=True)
+    except TypeError:
+        return torch.load(path, map_location="cpu")
+
+
+def _tensor_max_abs_diff(left: torch.Tensor, right: torch.Tensor) -> float:
+    if left.shape != right.shape:
+        return float("inf")
+    return float((left.detach().to(torch.float32) - right.detach().to(torch.float32)).abs().max().item())
+
+
+def _episode_max_abs_diff(base_payload: Dict, episode: Dict) -> float:
+    diffs = [_tensor_max_abs_diff(base_payload["id_cond"], episode["id_cond"])]
+    base_hidden = base_payload.get("id_vit_hidden", [])
+    episode_hidden = episode.get("id_vit_hidden", [])
+    if len(base_hidden) != len(episode_hidden):
+        return float("inf")
+    for left, right in zip(base_hidden, episode_hidden):
+        diffs.append(_tensor_max_abs_diff(left, right))
+    return max(diffs)
+
+
+def _validate_episodic_bank(args):
+    if "episodic" not in args.modes:
+        return
+
+    bank_path = PROJECT_ROOT / args.episodic_identity_memory_path
+    if not bank_path.exists():
+        raise FileNotFoundError(f"Episodic identity memory bank not found: {bank_path}")
+
+    bank_payload = _safe_torch_load(bank_path)
+    episodes = bank_payload.get("episodes", [])
+    if not episodes:
+        raise ValueError(f"Episodic identity memory bank has no episodes: {bank_path}")
+
+    if not args.identity_memory_path:
+        return
+
+    base_path = PROJECT_ROOT / args.identity_memory_path
+    if not base_path.exists():
+        raise FileNotFoundError(f"Base identity memory not found: {base_path}")
+
+    base_payload = _safe_torch_load(base_path)
+    diffs = [_episode_max_abs_diff(base_payload, episode) for episode in episodes]
+    has_distinct_episode = any(diff > args.memory_distinct_epsilon for diff in diffs)
+    if not has_distinct_episode and not args.allow_self_only_memory_bank:
+        raise ValueError(
+            "Episodic memory bank is self-only: every episode is numerically identical to "
+            f"{base_path}. Build a bank from distinct realistic reference episodes, or pass "
+            "--allow_self_only_memory_bank only for debugging no-op behavior. "
+            f"max_abs_diffs={diffs}"
+        )
+
+
+def _validate_temporal_coverage(args):
+    if args.num_frames < 1:
+        raise ValueError("--num_frames must be >= 1")
+    if args.segments < 1:
+        raise ValueError("--segments must be >= 1")
+    if args.chunk_size < 1:
+        raise ValueError("--chunk_size must be >= 1")
+    if args.min_num_chunks < 1:
+        raise ValueError("--min_num_chunks must be >= 1")
+
+    total_frames = args.num_frames * args.segments
+    required_frames = args.chunk_size * args.min_num_chunks
+    if total_frames < required_frames:
+        raise ValueError(
+            f"Identity persistence requires at least {args.min_num_chunks} chunks. "
+            f"Set --num_frames * --segments >= {required_frames} for --chunk_size {args.chunk_size}; "
+            f"current total is {args.num_frames} * {args.segments} = {total_frames}."
+        )
+
+
 def _write_aggregate(rows: List[Dict], output_dir: Path):
     if not rows:
         return
@@ -128,6 +251,105 @@ def _write_aggregate(rows: List[Dict], output_dir: Path):
     print(f"Aggregate JSON: {json_path}")
 
 
+def _run_quality_checks(rows: List[Dict], args, output_dir: Path) -> List[Dict]:
+    rows_by_key = {(row["category"], row["prompt_name"], row["seed"], row["mode"]): row for row in rows}
+    validation_rows = []
+
+    for row in rows:
+        reasons = []
+        if row["num_chunks"] < args.min_num_chunks:
+            reasons.append(f"num_chunks {row['num_chunks']} < {args.min_num_chunks}")
+        if row["detection_rate"] < args.min_detection_rate:
+            reasons.append(f"detection_rate {row['detection_rate']:.4f} < {args.min_detection_rate:.4f}")
+        if row["mean_similarity"] is None or row["mean_similarity"] < args.min_mean_similarity:
+            reasons.append(f"mean_similarity {row['mean_similarity']} < {args.min_mean_similarity:.4f}")
+        if row["min_similarity"] is None or row["min_similarity"] < args.min_frame_similarity:
+            reasons.append(f"min_similarity {row['min_similarity']} < {args.min_frame_similarity:.4f}")
+        if row["chunk_similarity_decay"] is not None and row["chunk_similarity_decay"] < -args.max_allowed_chunk_decay:
+            reasons.append(
+                f"chunk_similarity_decay {row['chunk_similarity_decay']:.4f} < {-args.max_allowed_chunk_decay:.4f}"
+            )
+        validation_rows.append(
+            {
+                "check_type": "single_run",
+                "category": row["category"],
+                "prompt_name": row["prompt_name"],
+                "seed": row["seed"],
+                "mode": row["mode"],
+                "passed": not reasons,
+                "reasons": "; ".join(reasons),
+                "mean_similarity": row["mean_similarity"],
+                "min_similarity": row["min_similarity"],
+                "detection_rate": row["detection_rate"],
+                "chunk_similarity_decay": row["chunk_similarity_decay"],
+                "baseline_video_md5": None,
+                "episodic_video_md5": None,
+                "mean_delta": None,
+                "min_delta": None,
+            }
+        )
+
+    comparison_keys = sorted(
+        {
+            (row["category"], row["prompt_name"], row["seed"])
+            for row in rows
+            if row["mode"] in {"baseline", "episodic"}
+        }
+    )
+    for category, prompt_name, seed in comparison_keys:
+        baseline = rows_by_key.get((category, prompt_name, seed, "baseline"))
+        episodic = rows_by_key.get((category, prompt_name, seed, "episodic"))
+        if baseline is None or episodic is None:
+            continue
+
+        baseline_md5 = _file_md5(Path(baseline["video_path"]))
+        episodic_md5 = _file_md5(Path(episodic["video_path"]))
+        mean_delta = episodic["mean_similarity"] - baseline["mean_similarity"]
+        min_delta = episodic["min_similarity"] - baseline["min_similarity"]
+        reasons = []
+        if baseline_md5 == episodic_md5:
+            reasons.append("baseline and episodic videos are byte-identical")
+        if mean_delta < args.min_episodic_mean_delta:
+            reasons.append(f"mean_delta {mean_delta:.4f} < {args.min_episodic_mean_delta:.4f}")
+        if min_delta < args.min_episodic_min_delta:
+            reasons.append(f"min_delta {min_delta:.4f} < {args.min_episodic_min_delta:.4f}")
+
+        validation_rows.append(
+            {
+                "check_type": "baseline_vs_episodic",
+                "category": category,
+                "prompt_name": prompt_name,
+                "seed": seed,
+                "mode": "comparison",
+                "passed": not reasons,
+                "reasons": "; ".join(reasons),
+                "mean_similarity": episodic["mean_similarity"],
+                "min_similarity": episodic["min_similarity"],
+                "detection_rate": episodic["detection_rate"],
+                "chunk_similarity_decay": episodic["chunk_similarity_decay"],
+                "baseline_video_md5": baseline_md5,
+                "episodic_video_md5": episodic_md5,
+                "mean_delta": mean_delta,
+                "min_delta": min_delta,
+            }
+        )
+
+    if not validation_rows:
+        return validation_rows
+
+    csv_path = output_dir / "identity_persistence_validation.csv"
+    json_path = output_dir / "identity_persistence_validation.json"
+    with csv_path.open("w", newline="", encoding="utf-8") as handle:
+        writer = csv.DictWriter(handle, fieldnames=list(validation_rows[0].keys()))
+        writer.writeheader()
+        writer.writerows(validation_rows)
+    with json_path.open("w", encoding="utf-8") as handle:
+        json.dump(validation_rows, handle, indent=2)
+    print(f"Validation CSV: {csv_path}")
+    print(f"Validation JSON: {json_path}")
+    return validation_rows
+
+
 def main():
     parser = argparse.ArgumentParser(description="Run baseline vs episodic identity persistence experiments.")
     parser.add_argument("--model_path", type=str, default="ckpts")
@@ -137,23 +359,37 @@ def main():
     parser.add_argument("--prompt_suite", type=str, default="eval/identity_prompt_suite.json")
     parser.add_argument("--output_dir", type=str, default="output/identity_persistence")
     parser.add_argument("--modes", nargs="+", default=["baseline", "episodic"], choices=["baseline", "episodic"])
-    parser.add_argument("--categories", nargs="+", default=["realistic", "stylized"])
+    parser.add_argument("--categories", nargs="+", default=["realistic"])
     parser.add_argument("--seeds", nargs="+", type=int, default=[42])
     parser.add_argument("--num_frames", type=int, default=49)
+    parser.add_argument("--segments", type=int, default=3)
     parser.add_argument("--num_inference_steps", type=int, default=50)
     parser.add_argument("--guidance_scale", type=float, default=6.0)
     parser.add_argument("--dtype", type=str, default="bfloat16", choices=["bfloat16", "float16"])
     parser.add_argument("--episodic_top_k", type=int, default=3)
     parser.add_argument("--episodic_min_similarity", type=float, default=0.45)
     parser.add_argument("--episodic_base_weight", type=float, default=1.0)
+    parser.add_argument("--episodic_exact_match_epsilon", type=float, default=0.0)
     parser.add_argument("--chunk_size", type=int, default=49)
+    parser.add_argument("--min_num_chunks", type=int, default=3)
     parser.add_argument("--sample_stride", type=int, default=1)
     parser.add_argument("--eval_device", type=str, default="cuda", choices=["cuda", "cpu"])
+    parser.add_argument("--memory_distinct_epsilon", type=float, default=1e-6)
+    parser.add_argument("--allow_self_only_memory_bank", action="store_true")
+    parser.add_argument("--min_detection_rate", type=float, default=0.95)
+    parser.add_argument("--min_mean_similarity", type=float, default=0.55)
+    parser.add_argument("--min_frame_similarity", type=float, default=0.35)
+    parser.add_argument("--max_allowed_chunk_decay", type=float, default=0.05)
+    parser.add_argument("--min_episodic_mean_delta", type=float, default=0.02)
+    parser.add_argument("--min_episodic_min_delta", type=float, default=0.02)
+    parser.add_argument("--fail_on_validation", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--execute", action="store_true", help="Run commands. Without this flag, only print them.")
     args = parser.parse_args()
 
     if not args.identity_image_path and not args.identity_memory_path:
         raise ValueError("Provide --identity_image_path or --identity_memory_path.")
+    _validate_temporal_coverage(args)
+    _validate_episodic_bank(args)
 
     suite = _load_prompt_suite(PROJECT_ROOT / args.prompt_suite)
     output_root = PROJECT_ROOT / args.output_dir
@@ -170,13 +406,30 @@ def main():
                     video_output_dir.mkdir(parents=True, exist_ok=True)
                     eval_output_dir.mkdir(parents=True, exist_ok=True)
 
-                    infer_command = _build_infer_command(args, mode, prompt_case["prompt"], video_output_dir, seed)
-                    before = _mp4_set(video_output_dir)
                     if args.execute:
-                        _run(infer_command, PROJECT_ROOT)
-                        video_path = _new_video(video_output_dir, before)
-                        if video_path is None:
-                            raise RuntimeError(f"No new video found for run: {run_name}")
+                        segment_paths = []
+                        for segment_index in range(args.segments):
+                            segment_dir = video_output_dir / f"segment_{segment_index:02d}"
+                            segment_dir.mkdir(parents=True, exist_ok=True)
+                            segment_seed = seed + segment_index
+                            infer_command = _build_infer_command(
+                                args,
+                                mode,
+                                prompt_case["prompt"],
+                                segment_dir,
+                                segment_seed,
+                            )
+                            before = _mp4_set(segment_dir)
+                            _run(infer_command, PROJECT_ROOT)
+                            segment_path = _new_video(segment_dir, before)
+                            if segment_path is None:
+                                raise RuntimeError(f"No new video found for run: {run_name} segment {segment_index}")
+                            segment_paths.append(segment_path)
+
+                        video_path = _concat_videos(
+                            segment_paths,
+                            video_output_dir / f"{seed}_joined_{args.segments}x{args.num_frames}.mp4",
+                        )
                         eval_command = _build_eval_command(args, video_path, eval_output_dir)
                         _run(eval_command, PROJECT_ROOT)
                         summary = _read_summary(eval_output_dir / "summary.json")
@@ -188,6 +441,12 @@ def main():
                                 "mode": mode,
                                 "seed": seed,
                                 "video_path": str(video_path),
+                                "segments": args.segments,
+                                "segment_frames": args.num_frames,
+                                "sampled_frames": summary["sampled_frames"],
+                                "detected_frames": summary["detected_frames"],
+                                "missing_frames": summary["missing_frames"],
+                                "num_chunks": summary["num_chunks"],
                                 "mean_similarity": summary["mean_similarity"],
                                 "min_similarity": summary["min_similarity"],
                                 "detection_rate": summary["detection_rate"],
@@ -198,12 +457,28 @@ def main():
                             }
                         )
                     else:
-                        print(" ".join(infer_command))
+                        for segment_index in range(args.segments):
+                            segment_dir = video_output_dir / f"segment_{segment_index:02d}"
+                            segment_seed = seed + segment_index
+                            infer_command = _build_infer_command(
+                                args,
+                                mode,
+                                prompt_case["prompt"],
+                                segment_dir,
+                                segment_seed,
+                            )
+                            print(shlex.join(infer_command))
+                        joined_placeholder = video_output_dir / f"{seed}_joined_{args.segments}x{args.num_frames}.mp4"
+                        print(f"Concatenate generated segments to: {joined_placeholder}")
                         print("After generation, evaluate the produced MP4 with:")
-                        print(" ".join(_build_eval_command(args, video_output_dir / "<generated>.mp4", eval_output_dir)))
+                        print(shlex.join(_build_eval_command(args, joined_placeholder, eval_output_dir)))
 
     if args.execute:
         _write_aggregate(aggregate_rows, output_root)
+        validation_rows = _run_quality_checks(aggregate_rows, args, output_root)
+        failed_rows = [row for row in validation_rows if not row["passed"]]
+        if failed_rows and args.fail_on_validation:
+            raise RuntimeError(f"Identity persistence validation failed ({len(failed_rows)} failed checks).")
 
 
 if __name__ == "__main__":

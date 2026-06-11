@@ -1,4 +1,23 @@
-python eval/arcface_identity_stability.py \
+# Realistic-only single-reference identity persistence gate.
+# Use this while you only have one target reference image/memory.
+
+set -euo pipefail
+cd "$(dirname "$0")"
+
+PYTHON="${PYTHON:-/mnt/share/Rainer/anaconda3/envs/consisid/bin/python}"
+
+"$PYTHON" - <<'PY'
+import sys
+import torch
+
+if not torch.cuda.is_available():
+    sys.exit(
+        "CUDA is not available to this process. ConsisID evaluation/generation currently requires a visible NVIDIA GPU. "
+        "Check nvidia-smi, driver/container GPU access, and /dev/nvidia* before rerunning."
+    )
+PY
+
+"$PYTHON" eval/arcface_identity_stability.py \
   --model_path ckpts \
   --video_path output/42_0010.mp4 \
   --identity_memory_path identity_memory.pt \
@@ -6,24 +25,27 @@ python eval/arcface_identity_stability.py \
   --sample_stride 1 \
   --output_dir output/42_0010_arcface_identity
 
-python eval/arcface_identity_stability.py \
-  --model_path ckpts \
-  --video_path output/your_long_video.mp4 \
-  --identity_image_path asserts/example_images/5.png \
-  --chunk_size 49 \
-  --sample_stride 1
+# Do not run episodic memory until you have multiple distinct realistic
+# same-identity memories. A self-only bank is a no-op, and a mixed-identity
+# bank will make identity preservation worse.
+# Example:
+# "$PYTHON" tools/identity_memory_bank.py \
+#   --input_identity_memory identity_memory_front.pt identity_memory_profile.pt identity_memory_occluded_recovered.pt \
+#   --bank_path identity_memory_bank.pt
 
-python tools/identity_memory_bank.py \
-  --input_identity_memory identity_memory.pt \
-  --bank_path identity_memory_bank.pt \
-  --source asserts/example_images/5.png
-
-python eval/run_identity_persistence_experiment.py \
+"$PYTHON" eval/run_identity_persistence_experiment.py \
   --model_path ckpts \
   --identity_memory_path identity_memory.pt \
-  --episodic_identity_memory_path identity_memory_bank.pt \
-  --output_dir output/identity_persistence \
-  --modes baseline episodic \
-  --categories realistic stylized \
+  --output_dir output/identity_persistence_realistic_single_ref \
+  --modes baseline \
+  --categories realistic \
   --seeds 42 \
+  --num_frames 49 \
+  --segments 3 \
+  --chunk_size 49 \
+  --min_num_chunks 3 \
+  --min_mean_similarity 0.55 \
+  --min_frame_similarity 0.35 \
+  --min_detection_rate 0.95 \
+  --max_allowed_chunk_decay 0.05 \
   --execute

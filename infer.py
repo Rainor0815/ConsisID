@@ -130,6 +130,8 @@ def generate_video(
     episodic_top_k: int = 3,
     episodic_min_similarity: float = 0.45,
     episodic_base_weight: float = 1.0,
+    episodic_exclude_exact_match: bool = True,
+    episodic_exact_match_epsilon: float = 0.0,
     episodic_update_memory: bool = False,
     episodic_memory_max_episodes: int = 64,
 ):
@@ -226,6 +228,8 @@ def generate_video(
             raw_id_cond,
             top_k=episodic_top_k,
             min_similarity=episodic_min_similarity,
+            exclude_exact_match=episodic_exclude_exact_match,
+            exact_match_epsilon=episodic_exact_match_epsilon,
         )
         id_cond, id_vit_hidden, memory_debug = blend_identity_conditioning(
             raw_id_cond,
@@ -234,6 +238,11 @@ def generate_video(
             base_weight=episodic_base_weight,
         )
         print(f"Episodic identity memory retrieval: {memory_debug}")
+        if not retrieved_identity:
+            print(
+                "Warning: episodic identity memory did not retrieve any eligible episodes. "
+                "Generation will use only the base identity conditioning."
+            )
         if episodic_update_memory:
             episode = make_identity_episode(
                 raw_id_cond,
@@ -334,6 +343,8 @@ if __name__ == "__main__":
     parser.add_argument("--episodic_top_k", type=int, default=3, help="Number of retrieved identity episodes to blend into conditioning.")
     parser.add_argument("--episodic_min_similarity", type=float, default=0.45, help="Minimum combined ArcFace/EVA similarity required for identity memory retrieval.")
     parser.add_argument("--episodic_base_weight", type=float, default=1.0, help="Weight assigned to the current identity features before blending retrieved memories.")
+    parser.add_argument("--episodic_exclude_exact_match", action=argparse.BooleanOptionalAction, default=True, help="Skip memory episodes whose identity conditioning is numerically identical to the current query.")
+    parser.add_argument("--episodic_exact_match_epsilon", type=float, default=0.0, help="Maximum identity-conditioning absolute difference treated as an exact self-match.")
     parser.add_argument("--episodic_update_memory", action="store_true", help="Append the current identity features to the episodic memory bank before generation.")
     parser.add_argument("--episodic_memory_max_episodes", type=int, default=64, help="Maximum number of episodes retained in the identity memory bank.")
     parser.add_argument("--prompt", type=str, default="The video captures a boy walking along a city street, filmed in black and white on a classic 35mm camera. His expression is thoughtful, his brow slightly furrowed as if he's lost in contemplation. The film grain adds a textured, timeless quality to the image, evoking a sense of nostalgia. Around him, the cityscape is filled with vintage buildings, cobblestone sidewalks, and softly blurred figures passing by, their outlines faint and indistinct. Streetlights cast a gentle glow, while shadows play across the boy's path, adding depth to the scene. The lighting highlights the boy's subtle smile, hinting at a fleeting moment of curiosity. The overall cinematic atmosphere, complete with classic film still aesthetics and dramatic contrasts, gives the scene an evocative and introspective feel.")
@@ -402,6 +413,8 @@ if __name__ == "__main__":
         episodic_top_k=args.episodic_top_k,
         episodic_min_similarity=args.episodic_min_similarity,
         episodic_base_weight=args.episodic_base_weight,
+        episodic_exclude_exact_match=args.episodic_exclude_exact_match,
+        episodic_exact_match_epsilon=args.episodic_exact_match_epsilon,
         episodic_update_memory=args.episodic_update_memory,
         episodic_memory_max_episodes=args.episodic_memory_max_episodes,
     )
