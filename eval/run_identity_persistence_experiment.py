@@ -3,6 +3,7 @@ import csv
 import hashlib
 import json
 import os
+import shutil
 import shlex
 import subprocess
 import sys
@@ -84,6 +85,9 @@ def _build_infer_command(
     prompt: str,
     output_dir: Path,
     seed: int,
+    episodic_identity_memory_path: Optional[str] = None,
+    episodic_top_k: Optional[int] = None,
+    episodic_base_weight: Optional[float] = None,
 ) -> List[str]:
     command = [
         sys.executable,
@@ -115,13 +119,13 @@ def _build_infer_command(
         command.extend(
             [
                 "--episodic_identity_memory_path",
-                args.episodic_identity_memory_path,
+                episodic_identity_memory_path or args.episodic_identity_memory_path,
                 "--episodic_top_k",
-                str(args.episodic_top_k),
+                str(episodic_top_k if episodic_top_k is not None else args.episodic_top_k),
                 "--episodic_min_similarity",
                 str(args.episodic_min_similarity),
                 "--episodic_base_weight",
-                str(args.episodic_base_weight),
+                str(episodic_base_weight if episodic_base_weight is not None else args.episodic_base_weight),
                 "--episodic_exclude_exact_match",
                 "--episodic_exact_match_epsilon",
                 str(args.episodic_exact_match_epsilon),
@@ -155,9 +159,102 @@ def _build_eval_command(args, video_path: Path, output_dir: Path) -> List[str]:
     return command
 
 
+def _build_guarded_update_command(args, video_path: Path, eval_output_dir: Path, bank_path: Path, output_dir: Path, label: str) -> List[str]:
+    return [
+        sys.executable,
+        "tools/guarded_memory_update_from_video.py",
+        "--model_path",
+        args.model_path,
+        "--video_path",
+        str(video_path),
+        "--summary_json",
+        str(eval_output_dir / "summary.json"),
+        "--frame_scores_csv",
+        str(eval_output_dir / "frame_scores.csv"),
+        "--bank_path",
+        str(bank_path),
+        "--accepted_frame_dir",
+        str(output_dir / "accepted_online_frames"),
+        "--report_csv",
+        str(output_dir / "guarded_memory_update.csv"),
+        "--min_segment_detection_rate",
+        str(args.online_update_min_detection_rate),
+        "--min_segment_mean_similarity",
+        str(args.online_update_min_mean_similarity),
+        "--min_frame_similarity",
+        str(args.online_update_min_frame_similarity),
+        "--max_frames",
+        str(args.online_update_max_frames_per_segment),
+        "--crop_margin",
+        str(args.online_update_crop_margin),
+        "--max_episodes",
+        str(args.episodic_memory_max_episodes),
+        "--dtype",
+        args.dtype,
+        "--source_label",
+        label,
+    ]
+
+
 def _read_summary(path: Path) -> Dict:
     with path.open("r", encoding="utf-8") as handle:
         return json.load(handle)
+
+
+def _evaluate_video(args, video_path: Path, eval_output_dir: Path) -> Dict:
+    eval_output_dir.mkdir(parents=True, exist_ok=True)
+    _run(_build_eval_command(args, video_path, eval_output_dir), PROJECT_ROOT)
+    return _read_summary(eval_output_dir / "summary.json")
+
+
+def _summary_metric(value, fallback: float = -1.0) -> float:
+    return fallback if value is None else float(value)
+
+
+def _segment_quality_key(summary: Dict):
+    return (
+        float(summary.get("detection_rate") or 0.0),
+        _summary_metric(summary.get("mean_similarity")),
+        _summary_metric(summary.get("min_similarity")),
+    )
+
+
+def _segment_needs_rerun(summary: Dict, args) -> bool:
+    if float(summary.get("detection_rate") or 0.0) < args.rerun_min_detection_rate:
+        return True
+    if _summary_metric(summary.get("mean_similarity")) < args.rerun_min_mean_similarity:
+        return True
+    if _summary_metric(summary.get("min_similarity")) < args.rerun_min_frame_similarity:
+        return True
+    return False
+
+
+def _scheduled_base_weight(args, segment_index: int) -> float:
+    if args.episodic_base_weight_late is None or args.segments <= 1:
+        return args.episodic_base_weight
+    progress = segment_index / max(args.segments - 1, 1)
+    return args.episodic_base_weight + (args.episodic_base_weight_late - args.episodic_base_weight) * progress
+
+
+def _scheduled_top_k(args, segment_index: int) -> int:
+    if args.episodic_top_k_late is None or args.segments <= 1:
+        return args.episodic_top_k
+    progress = segment_index / max(args.segments - 1, 1)
+    value = round(args.episodic_top_k + (args.episodic_top_k_late - args.episodic_top_k) * progress)
+    return max(1, int(value))
+
+
+def _prepare_online_memory_bank(args, output_root: Path, run_name: str) -> Optional[Path]:
+    if not args.online_memory_update:
+        return None
+    source = PROJECT_ROOT / args.episodic_identity_memory_path
+    if args.online_memory_path:
+        target = PROJECT_ROOT / args.online_memory_path
+    else:
+        target = output_root / "online_memory_banks" / f"{run_name}.pt"
+    target.parent.mkdir(parents=True, exist_ok=True)
+    shutil.copy2(source, target)
+    return target
 
 
 def _safe_torch_load(path: Path) -> Dict:
@@ -234,6 +331,21 @@ def _validate_temporal_coverage(args):
             f"Set --num_frames * --segments >= {required_frames} for --chunk_size {args.chunk_size}; "
             f"current total is {args.num_frames} * {args.segments} = {total_frames}."
         )
+
+
+def _write_segment_attempts(rows: List[Dict], output_dir: Path):
+    if not rows:
+        return
+    csv_path = output_dir / "segment_attempts.csv"
+    json_path = output_dir / "segment_attempts.json"
+    with csv_path.open("w", newline="", encoding="utf-8") as handle:
+        writer = csv.DictWriter(handle, fieldnames=list(rows[0].keys()))
+        writer.writeheader()
+        writer.writerows(rows)
+    with json_path.open("w", encoding="utf-8") as handle:
+        json.dump(rows, handle, indent=2)
+    print(f"Segment attempts CSV: {csv_path}")
+    print(f"Segment attempts JSON: {json_path}")
 
 
 def _write_aggregate(rows: List[Dict], output_dir: Path):
@@ -369,7 +481,10 @@ def main():
     parser.add_argument("--episodic_top_k", type=int, default=3)
     parser.add_argument("--episodic_min_similarity", type=float, default=0.45)
     parser.add_argument("--episodic_base_weight", type=float, default=1.0)
+    parser.add_argument("--episodic_top_k_late", type=int, default=None)
+    parser.add_argument("--episodic_base_weight_late", type=float, default=None)
     parser.add_argument("--episodic_exact_match_epsilon", type=float, default=0.0)
+    parser.add_argument("--episodic_memory_max_episodes", type=int, default=96)
     parser.add_argument("--chunk_size", type=int, default=49)
     parser.add_argument("--min_num_chunks", type=int, default=3)
     parser.add_argument("--sample_stride", type=int, default=1)
@@ -382,6 +497,20 @@ def main():
     parser.add_argument("--max_allowed_chunk_decay", type=float, default=0.05)
     parser.add_argument("--min_episodic_mean_delta", type=float, default=0.02)
     parser.add_argument("--min_episodic_min_delta", type=float, default=0.02)
+    parser.add_argument("--online_memory_update", action="store_true")
+    parser.add_argument("--online_memory_path", type=str, default=None)
+    parser.add_argument("--online_update_min_detection_rate", type=float, default=0.9)
+    parser.add_argument("--online_update_min_mean_similarity", type=float, default=0.45)
+    parser.add_argument("--online_update_min_frame_similarity", type=float, default=0.55)
+    parser.add_argument("--online_update_max_frames_per_segment", type=int, default=2)
+    parser.add_argument("--online_update_crop_margin", type=float, default=0.35)
+    parser.add_argument("--rerun_failed_segments", action="store_true")
+    parser.add_argument("--rerun_max_attempts", type=int, default=1)
+    parser.add_argument("--rerun_min_detection_rate", type=float, default=0.9)
+    parser.add_argument("--rerun_min_mean_similarity", type=float, default=0.45)
+    parser.add_argument("--rerun_min_frame_similarity", type=float, default=0.35)
+    parser.add_argument("--rerun_base_weight", type=float, default=None)
+    parser.add_argument("--rerun_top_k", type=int, default=None)
     parser.add_argument("--fail_on_validation", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--execute", action="store_true", help="Run commands. Without this flag, only print them.")
     args = parser.parse_args()
@@ -403,8 +532,22 @@ def main():
                     run_name = f"{category}_{prompt_case['name']}_{mode}_seed{seed}"
                     video_output_dir = output_root / "videos" / run_name
                     eval_output_dir = output_root / "scores" / run_name
+                    segment_eval_root = output_root / "segment_scores" / run_name
+                    advanced_segment_controls = (
+                        mode == "episodic" and (args.online_memory_update or args.rerun_failed_segments)
+                    )
                     video_output_dir.mkdir(parents=True, exist_ok=True)
                     eval_output_dir.mkdir(parents=True, exist_ok=True)
+                    segment_eval_root.mkdir(parents=True, exist_ok=True)
+                    online_memory_bank = _prepare_online_memory_bank(args, output_root, run_name) if mode == "episodic" else None
+                    memory_path_for_generation = (
+                        str(online_memory_bank.relative_to(PROJECT_ROOT))
+                        if online_memory_bank is not None and online_memory_bank.is_relative_to(PROJECT_ROOT)
+                        else str(online_memory_bank)
+                        if online_memory_bank is not None
+                        else args.episodic_identity_memory_path
+                    )
+                    segment_attempt_rows = []
 
                     if args.execute:
                         segment_paths = []
@@ -412,27 +555,99 @@ def main():
                             segment_dir = video_output_dir / f"segment_{segment_index:02d}"
                             segment_dir.mkdir(parents=True, exist_ok=True)
                             segment_seed = seed + segment_index
-                            infer_command = _build_infer_command(
-                                args,
-                                mode,
-                                prompt_case["prompt"],
-                                segment_dir,
-                                segment_seed,
-                            )
-                            before = _mp4_set(segment_dir)
-                            _run(infer_command, PROJECT_ROOT)
-                            segment_path = _new_video(segment_dir, before)
-                            if segment_path is None:
-                                raise RuntimeError(f"No new video found for run: {run_name} segment {segment_index}")
-                            segment_paths.append(segment_path)
+                            attempt_summaries = []
+                            max_attempts = 1 + (args.rerun_max_attempts if args.rerun_failed_segments and mode == "episodic" else 0)
+                            for attempt_index in range(max_attempts):
+                                attempt_dir = (
+                                    segment_dir / f"attempt_{attempt_index:02d}"
+                                    if advanced_segment_controls
+                                    else segment_dir
+                                )
+                                attempt_dir.mkdir(parents=True, exist_ok=True)
+                                attempt_base_weight = _scheduled_base_weight(args, segment_index)
+                                attempt_top_k = _scheduled_top_k(args, segment_index)
+                                if attempt_index > 0:
+                                    if args.rerun_base_weight is not None:
+                                        attempt_base_weight = args.rerun_base_weight
+                                    if args.rerun_top_k is not None:
+                                        attempt_top_k = args.rerun_top_k
+
+                                infer_command = _build_infer_command(
+                                    args,
+                                    mode,
+                                    prompt_case["prompt"],
+                                    attempt_dir,
+                                    segment_seed,
+                                    episodic_identity_memory_path=memory_path_for_generation,
+                                    episodic_top_k=attempt_top_k,
+                                    episodic_base_weight=attempt_base_weight,
+                                )
+                                before = _mp4_set(attempt_dir)
+                                _run(infer_command, PROJECT_ROOT)
+                                attempt_path = _new_video(attempt_dir, before)
+                                if attempt_path is None:
+                                    raise RuntimeError(
+                                        f"No new video found for run: {run_name} segment {segment_index} attempt {attempt_index}"
+                                    )
+
+                                attempt_summary = None
+                                if advanced_segment_controls:
+                                    attempt_eval_dir = segment_eval_root / f"segment_{segment_index:02d}_attempt_{attempt_index:02d}"
+                                    attempt_summary = _evaluate_video(args, attempt_path, attempt_eval_dir)
+                                    attempt_summaries.append((attempt_path, attempt_eval_dir, attempt_summary))
+                                    segment_attempt_rows.append(
+                                        {
+                                            "run_name": run_name,
+                                            "segment_index": segment_index,
+                                            "attempt_index": attempt_index,
+                                            "video_path": str(attempt_path),
+                                            "episodic_memory_path": memory_path_for_generation,
+                                            "episodic_top_k": attempt_top_k,
+                                            "episodic_base_weight": attempt_base_weight,
+                                            "detection_rate": attempt_summary["detection_rate"],
+                                            "mean_similarity": attempt_summary["mean_similarity"],
+                                            "min_similarity": attempt_summary["min_similarity"],
+                                            "accepted_attempt": False,
+                                            "rerun_reason": "failed_guard" if _segment_needs_rerun(attempt_summary, args) else "",
+                                        }
+                                    )
+                                    if not _segment_needs_rerun(attempt_summary, args):
+                                        break
+                                else:
+                                    attempt_summaries.append((attempt_path, None, attempt_summary))
+                                    break
+
+                            if advanced_segment_controls:
+                                best_path, best_eval_dir, best_summary = max(
+                                    attempt_summaries,
+                                    key=lambda item: _segment_quality_key(item[2]),
+                                )
+                                for row in segment_attempt_rows:
+                                    if row["run_name"] == run_name and row["segment_index"] == segment_index:
+                                        row["accepted_attempt"] = row["video_path"] == str(best_path)
+                                if args.online_memory_update and mode == "episodic":
+                                    guarded_dir = segment_eval_root / f"segment_{segment_index:02d}_guarded_update"
+                                    guarded_dir.mkdir(parents=True, exist_ok=True)
+                                    _run(
+                                        _build_guarded_update_command(
+                                            args,
+                                            best_path,
+                                            best_eval_dir,
+                                            online_memory_bank,
+                                            guarded_dir,
+                                            f"{run_name}:segment_{segment_index:02d}",
+                                        ),
+                                        PROJECT_ROOT,
+                                    )
+                                segment_paths.append(best_path)
+                            else:
+                                segment_paths.append(attempt_summaries[-1][0])
 
                         video_path = _concat_videos(
                             segment_paths,
                             video_output_dir / f"{seed}_joined_{args.segments}x{args.num_frames}.mp4",
                         )
-                        eval_command = _build_eval_command(args, video_path, eval_output_dir)
-                        _run(eval_command, PROJECT_ROOT)
-                        summary = _read_summary(eval_output_dir / "summary.json")
+                        summary = _evaluate_video(args, video_path, eval_output_dir)
                         aggregate_rows.append(
                             {
                                 "run_name": run_name,
@@ -456,6 +671,8 @@ def main():
                                 "chunk_mean_similarity_slope": summary["chunk_mean_similarity_slope"],
                             }
                         )
+                        if segment_attempt_rows:
+                            _write_segment_attempts(segment_attempt_rows, segment_eval_root)
                     else:
                         for segment_index in range(args.segments):
                             segment_dir = video_output_dir / f"segment_{segment_index:02d}"
@@ -466,8 +683,16 @@ def main():
                                 prompt_case["prompt"],
                                 segment_dir,
                                 segment_seed,
+                                episodic_identity_memory_path=memory_path_for_generation,
+                                episodic_top_k=_scheduled_top_k(args, segment_index),
+                                episodic_base_weight=_scheduled_base_weight(args, segment_index),
                             )
                             print(shlex.join(infer_command))
+                            if advanced_segment_controls:
+                                print(
+                                    "After this segment, evaluate it, optionally rerun failed attempts, "
+                                    "and run guarded_memory_update_from_video.py for accepted segments."
+                                )
                         joined_placeholder = video_output_dir / f"{seed}_joined_{args.segments}x{args.num_frames}.mp4"
                         print(f"Concatenate generated segments to: {joined_placeholder}")
                         print("After generation, evaluate the produced MP4 with:")

@@ -48,6 +48,18 @@ def _identity_parts(id_cond: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
     return id_cond[:, :512], id_cond[:, 512:]
 
 
+def identity_conditioning_similarity(left_id_cond: torch.Tensor, right_id_cond: torch.Tensor) -> Dict[str, float]:
+    left_ante, left_vit = _identity_parts(left_id_cond)
+    right_ante, right_vit = _identity_parts(right_id_cond)
+    arcface_similarity = _cosine_similarity(left_ante, right_ante)
+    vit_similarity = _cosine_similarity(left_vit, right_vit)
+    return {
+        "arcface_similarity": arcface_similarity,
+        "vit_similarity": vit_similarity,
+        "score": 0.8 * arcface_similarity + 0.2 * vit_similarity,
+    }
+
+
 def make_identity_episode(
     id_cond: torch.Tensor,
     id_vit_hidden: List[torch.Tensor],
